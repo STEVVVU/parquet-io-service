@@ -34,6 +34,10 @@ impl S3Reader {
             .load()
             .await;
         let client = Client::new(&config);
+        Self::with_client(client, bucket, keys)
+    }
+
+    pub fn with_client(client: Client, bucket: String, keys: Vec<String>) -> Self {
         Self {
             client,
             bucket,
@@ -102,7 +106,11 @@ impl Stream for S3ReaderStream {
                     self.object_body = Some(object.body);
                     self.poll_next(cx)
                 }
-                Err(e) => Poll::Ready(Some(Err(ParpulseError::from(e)))),
+                Err(e) => {
+                    self.object_fut = None;
+                    self.current_key = self.keys.len();
+                    Poll::Ready(Some(Err(ParpulseError::from(e))))
+                }
             }
         } else if let Some(object_body) = self.object_body.as_mut() {
             let poll_result = object_body.try_next().boxed().poll_unpin(cx);
@@ -113,7 +121,11 @@ impl Stream for S3ReaderStream {
                         self.object_body = None;
                         self.poll_next(cx)
                     }
-                    Err(e) => Poll::Ready(Some(Err(ParpulseError::from(e)))),
+                    Err(e) => {
+                        self.object_body = None;
+                        self.current_key = self.keys.len();
+                        Poll::Ready(Some(Err(ParpulseError::from(e))))
+                    }
                 },
                 Poll::Pending => Poll::Pending,
             }
@@ -164,6 +176,13 @@ impl AsyncStorageReader for S3Reader {
     }
 
     async fn into_stream(self) -> ParpulseResult<StorageReaderStream> {
+        if self.keys.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "S3 stream requires at least one object key",
+            )
+            .into());
+        }
         let s3_stream = S3ReaderStream::new(self.client, self.bucket, self.keys);
         Ok(Box::pin(s3_stream))
     }

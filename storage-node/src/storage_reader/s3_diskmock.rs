@@ -1,5 +1,6 @@
 use std::{
     env,
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
     thread,
@@ -28,6 +29,7 @@ const MAX_DISK_READ_SIZE: usize = 1024 * 1024;
 /// TODO: We can also use automock to mock s3. (so there is no need to manually sync changes)
 pub struct MockS3Reader {
     file_paths: Vec<String>,
+    fixture_root: PathBuf,
     disk_manager: DiskManager,
 }
 
@@ -51,14 +53,39 @@ impl MockS3Reader {
             .collect();
         MockS3Reader {
             file_paths,
+            fixture_root: PathBuf::from(base_path).join("tests"),
             disk_manager: DiskManager::default(),
         }
     }
 
+    fn validated_paths(&self) -> ParpulseResult<Vec<String>> {
+        let root = self.fixture_root.canonicalize()?;
+        self.file_paths
+            .iter()
+            .map(|path| {
+                let path = PathBuf::from(path).canonicalize()?;
+                if !path.starts_with(root.join("parquet")) && !path.starts_with(root.join("text")) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "local source is restricted to the Parquet and text fixture directories",
+                    )
+                    .into());
+                }
+                path.into_os_string().into_string().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "fixture path is not UTF-8",
+                    )
+                    .into()
+                })
+            })
+            .collect()
+    }
+
     pub async fn get_object_size(&self) -> ParpulseResult<usize> {
         let mut size = 0;
-        for file_path in &self.file_paths {
-            size += self.disk_manager.file_size(file_path).await? as usize;
+        for file_path in self.validated_paths()? {
+            size += self.disk_manager.file_size(&file_path).await? as usize;
         }
         Ok(size)
     }
@@ -121,15 +148,15 @@ impl Stream for MockS3ReaderStream {
 impl AsyncStorageReader for MockS3Reader {
     async fn read_all(&self) -> ParpulseResult<Vec<Bytes>> {
         let mut bytes_vec = Vec::with_capacity(self.file_paths.len());
-        for file_path in &self.file_paths {
-            let (_, data) = self.disk_manager.read_disk_all(file_path).await?;
+        for file_path in self.validated_paths()? {
+            let (_, data) = self.disk_manager.read_disk_all(&file_path).await?;
             bytes_vec.push(data);
         }
         Ok(bytes_vec)
     }
 
     async fn into_stream(self) -> ParpulseResult<StorageReaderStream> {
-        Ok(Box::pin(MockS3ReaderStream::new(self.file_paths)))
+        Ok(Box::pin(MockS3ReaderStream::new(self.validated_paths()?)))
     }
 }
 

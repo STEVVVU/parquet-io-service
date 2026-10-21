@@ -73,21 +73,15 @@ impl DiskStore {
         let mut disk_stream = self.disk_manager.disk_read_stream(key, buffer_size).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_DISK_CHANNEL_BUFFER_SIZE);
         tokio::spawn(async move {
-            loop {
-                match disk_stream.next().await {
-                    Some(Ok(bytes_read)) => {
-                        tx.send(Ok(Bytes::from(disk_stream.buffer()[..bytes_read].to_vec())))
-                            .await
-                            .unwrap();
-                    }
-                    Some(Err(e)) => tx.send(Err(e)).await.unwrap(),
-                    None => {
-                        // TODO(lanlou): when second read, so there is no need to unpin, how to improve?
-                        disk_replacer.lock().await.unpin(&key_replacer);
-                        break;
-                    }
+            while let Some(result) = disk_stream.next().await {
+                let result = result
+                    .map(|bytes_read| Bytes::copy_from_slice(&disk_stream.buffer()[..bytes_read]));
+                let failed = result.is_err();
+                if tx.send(result).await.is_err() || failed {
+                    break;
                 }
             }
+            disk_replacer.lock().await.unpin(&key_replacer);
         });
         Ok(Some(rx))
     }

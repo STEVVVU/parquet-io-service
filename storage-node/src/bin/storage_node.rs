@@ -13,5 +13,5 @@ async fn main() {
     }
     info!("starting storage node server...");
     let config = ParpulseConfig::parse();
-    storage_node_serve("0.0.0.0", 3030, config).await.unwrap();
+    storage_node_serve("127.0.0.1", 3030, config).await.unwrap();
 }

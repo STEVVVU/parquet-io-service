@@ -1,8 +1,5 @@
 use bytes::Bytes;
 use futures::stream::StreamExt;
-use futures::{future::TryFutureExt, join};
-
-use std::future::IntoFuture;
 use std::io::SeekFrom;
 
 use std::path::{Path, PathBuf};
@@ -10,9 +7,9 @@ use std::pin::Pin;
 
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncSeekExt;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::error::{ParpulseError, ParpulseResult};
+use crate::error::ParpulseResult;
 use crate::storage_reader::StorageReaderStream;
 
 use super::stream::DiskReadStream;
@@ -38,6 +35,7 @@ impl DiskManager {
             options.create(true);
         }
         options.append(append);
+        options.truncate(!append);
         Ok(options.open(&path_buf).await?)
     }
 
@@ -88,26 +86,19 @@ impl DiskManager {
     /// 2. When memory cache is disabled, bytes_vec should be None and stream should be Some.
     /// 3. When writing data which cannot be written to memory cache, both bytes_vec and stream should be Some.
     ///
-    /// FIXME: disk_path should not exist, otherwise throw an error
-    /// TODO(lanlou): we must handle write-write conflict correctly in the future.
-    /// One way is using `write commit` to handle read-write conflict, then there is no w-w conflict.
-    /// TODO(lanlou): We need to write data to disk & send data to network at the same time.
-    /// TODO(lanlou): S3 stream now returns 10^5 bytes one time, and do we need to group all the bytes for
-    /// one file and write all of them to disk at once?
     pub async fn write_bytes_and_stream_to_disk(
         &self,
         bytes_vec: Option<Vec<Bytes>>,
         stream: Option<StorageReaderStream>,
         disk_path: &str,
     ) -> ParpulseResult<usize> {
-        if Path::new(disk_path).exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "disk file to write already exists",
-            )
-            .into());
-        }
-        let mut file = self.open_or_create(disk_path, true).await?;
+        let parent = Path::new(disk_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).await?;
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let mut file = File::from_std(temporary.reopen()?);
         let mut bytes_written = 0;
 
         if let Some(bytes_vec) = bytes_vec {
@@ -118,31 +109,18 @@ impl DiskManager {
         }
 
         if let Some(mut stream) = stream {
-            let bytes_cur = stream.next().await;
-            if bytes_cur.is_none() {
-                file.flush().await?;
-                return Ok(bytes_written);
-            }
-            let mut bytes_cur = bytes_cur.unwrap()?;
-            loop {
-                let disk_write_fut = TryFutureExt::into_future(file.write_all(&bytes_cur));
-                let bytes_next_fut = stream.next().into_future();
-                match join!(disk_write_fut, bytes_next_fut) {
-                    (Ok(_), Some(Ok(bytes_next))) => {
-                        bytes_written += bytes_cur.len();
-                        bytes_cur = bytes_next;
-                    }
-                    (Ok(_), None) => {
-                        bytes_written += bytes_cur.len();
-                        break;
-                    }
-                    (Err(e), _) => return Err(ParpulseError::Disk(e)),
-                    (Ok(_), Some(Err(e))) => return Err(e),
-                }
+            while let Some(bytes) = stream.next().await {
+                let bytes = bytes?;
+                file.write_all(&bytes).await?;
+                bytes_written += bytes.len();
             }
         }
-        // FIXME: do we need a flush here?
         file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        temporary
+            .persist_noclobber(disk_path)
+            .map_err(|e| e.error)?;
         Ok(bytes_written)
     }
 

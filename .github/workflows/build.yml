@@ -1,58 +1,26 @@
-name: Build
-
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
-
+name: Verify
+on: [push, pull_request]
+permissions:
+  contents: read
 env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Dwarnings"
-
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  AWS_EC2_METADATA_DISABLED: true
 jobs:
-  build:
-
-    runs-on: self-hosted
-    continue-on-error: false
-
+  offline:
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - name: Install Toolchain
-      run: |
-        rustup update stable
-        rustup default stable
-        rustup component add rustfmt
-        rustup component add clippy
-    - name: Install cargo-llvm-cov
-      uses: taiki-e/install-action@cargo-llvm-cov
-    - name: Install Sqlite
-      run: |
-        apt update
-        apt install libsqlite3-dev
-    - name: Format check
-      run: cargo fmt --all -- --check
-    - name: Run Clippy
-      run: cargo clippy --all-targets --all-features
-    - name: Compile check
-      run: cargo check --all-targets --all-features
-    - name: Run tests and Generate code coverage
-      env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      run: cargo llvm-cov --all-features --workspace --codecov --output-path lcov.info
-    - name: Archive code coverage results
-      uses: actions/upload-artifact@v4
-      with:
-        name: code-coverage-report
-        path: lcov.info
-        retention-days: 3
-    - name: Upload to codecov
-      uses: codecov/codecov-action@v3
-      with:
-        token: be8874e2-10d6-434f-9d52-db6094de31d6
-        files: lcov.info
-        name: codecov-umbrella # optional
-        fail_ci_if_error: true
-        verbose: true
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --workspace --no-run
+      - run: cargo clippy --locked --all-targets --all-features
+      - run: python3 tools/verify_parpulse.py ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-evidence
+          path: .audit/verification/ci

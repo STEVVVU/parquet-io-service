@@ -357,16 +357,23 @@ impl<R: DataStoreReplacer<MemDiskStoreReplacerKey, MemDiskStoreReplacerValue>> D
             remote_location
         );
 
-        let (mut data_stream, _) = {
+        let source_stream = {
             match request {
                 RequestParams::S3((bucket, keys)) => {
                     let reader = S3Reader::new(bucket.clone(), keys.clone().to_vec()).await;
-                    (reader.into_stream().await?, 0)
+                    reader.into_stream().await
                 }
                 RequestParams::MockS3((bucket, keys)) => {
                     let reader = MockS3Reader::new(bucket.clone(), keys.clone().to_vec()).await;
-                    (reader.into_stream().await?, 0)
+                    reader.into_stream().await
                 }
+            }
+        };
+        let mut data_stream = match source_stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.notify_waiters_error(&remote_location).await;
+                return Err(error);
             }
         };
 

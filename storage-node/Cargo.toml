@@ -22,10 +22,11 @@ reqwest = "0.12"
 tempfile = "3.10.1"
 rand = "0.8"
 tokio-stream = "0.1"
-rusqlite = { version = "0.31", features = ["blob"] }
+rusqlite = { version = "0.31", features = ["blob", "bundled"] }
 log = "0.4"
 env_logger = "0.11"
 crc32fast = "1.4.0"
+sha2 = "0.11.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 

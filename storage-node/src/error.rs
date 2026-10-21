@@ -6,7 +6,7 @@ pub enum ParpulseError {
     #[error("Disk error: {0}")]
     Disk(#[source] std::io::Error),
     #[error("S3 error: {0}")]
-    S3(#[source] Box<dyn std::error::Error>),
+    S3(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Internal error: {0}")]
     Internal(String),
     #[error("SQLite error: {0}")]
@@ -42,6 +42,3 @@ impl From<rusqlite::Error> for ParpulseError {
 }
 
 pub type ParpulseResult<T> = std::result::Result<T, ParpulseError>;
-
-unsafe impl Send for ParpulseError {}
-unsafe impl Sync for ParpulseError {}

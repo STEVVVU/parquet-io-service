@@ -25,6 +25,8 @@ reqwest = { version = "0.12", features = ["stream"] }
 tempfile = "3.2"
 parquet = { version = "50.0.0", features = ["async"] }
 arrow = "50.0.0"
+# Arrow 50's quarter extension conflicts with newer Chrono's Datelike method.
+chrono = "=0.4.34"
 log = "0.4"
 istziio-client = "0.1.9"
 lazy_static = "1.4"

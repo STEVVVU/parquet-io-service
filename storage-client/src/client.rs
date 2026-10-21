@@ -10,8 +10,8 @@ use parquet::arrow::ProjectionMask;
 use reqwest::{Client, Response, Url};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
 use tempfile::tempdir;
+use tokio::io::AsyncWriteExt;
 
 use tokio::sync::mpsc::{channel, Receiver};
 
@@ -76,50 +76,88 @@ impl StorageClientImpl {
                 return Err(anyhow!("Only table request is supported."));
             }
         };
-        let keys = vec![TABLE_FILE_MAP.get(&table_id).unwrap().to_string()];
+        let keys = vec![TABLE_FILE_MAP
+            .get(&table_id)
+            .ok_or_else(|| anyhow!("Unknown table {table_id}"))?
+            .to_string()];
         Ok(RequestParams::S3((bucket, keys)))
     }
 
     async fn get_data_from_response(response: Response) -> Result<Receiver<RecordBatch>> {
-        if response.status().is_success() {
-            // Store the streamed Parquet file in a temporary file.
-            // FIXME: 1. Do we really need streaming here?
-            //       2. Do we need to store the file in a temporary file?
-            let temp_dir = tempdir()?;
-            let file_path = temp_dir.path().join("tmp.parquet");
-            let mut file = File::create(&file_path)?;
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                file.write_all(&chunk)?;
-            }
-
-            // Convert the Parquet file to a record batch.
-            let file = File::open(file_path)?;
-            let builder =
-                ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(BATCH_SIZE);
-            let mask = ProjectionMask::all();
-            let mut reader = builder.with_projection(mask).build()?;
-
-            let (tx, rx) = channel(CHANNEL_CAPACITY);
-
-            // Return the record batch as a stream.
-            tokio::spawn(async move {
-                while let Some(core::result::Result::Ok(rb)) = reader.next() {
-                    tx.send(rb).await.unwrap();
-                }
-            });
-            Ok(rx)
-        } else {
-            Err(anyhow::anyhow!(
-                "Failed to download file. Response: {:?}, Body: {}",
-                response.status(),
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| String::from("Failed to read response body"))
-            ))
+        let mut checked = Self::get_data_from_response_checked(response).await?;
+        // The external legacy trait cannot carry a late error, so validate before exposing any rows.
+        let mut batches = Vec::new();
+        while let Some(batch) = checked.recv().await {
+            batches.push(batch?);
         }
+        let (tx, rx) = channel(CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            for batch in batches {
+                if tx.send(batch).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    async fn get_data_from_response_checked(
+        response: Response,
+    ) -> Result<Receiver<Result<RecordBatch>>> {
+        let response = response.error_for_status()?;
+        let temp_dir = tempdir()?;
+        let file_path = temp_dir.path().join("tmp.parquet");
+        let mut file = tokio::fs::File::create(&file_path).await?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.flush().await?;
+        drop(file);
+        let (tx, rx) = channel(CHANNEL_CAPACITY);
+        tokio::task::spawn_blocking(move || {
+            let decode = || -> Result<()> {
+                let file = File::open(file_path)?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                    .with_batch_size(BATCH_SIZE)
+                    .with_projection(ProjectionMask::all())
+                    .build()?;
+                for batch in reader {
+                    let batch = batch?;
+                    if tx.blocking_send(Ok(batch)).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            };
+            if let Err(error) = decode() {
+                let _ = tx.blocking_send(Err(error));
+            }
+            drop(temp_dir);
+        });
+        Ok(rx)
+    }
+
+    pub async fn request_object_checked(
+        &self,
+        request: RequestParams,
+    ) -> Result<Receiver<Result<RecordBatch>>> {
+        let (location, is_test) = match request {
+            RequestParams::S3(location) => (location, false),
+            RequestParams::MockS3(location) => (location, true),
+        };
+        if location.1.len() != 1 || location.1[0].is_empty() || location.0.is_empty() {
+            return Err(anyhow!(
+                "The HTTP object API requires one nonempty bucket and key"
+            ));
+        }
+        let (url, mut params) = self.get_request_url_and_params(location)?;
+        if is_test {
+            params.push(("is_test", "true".to_owned()));
+        }
+        let url = Url::parse_with_params(&url, params)?;
+        let response = Client::new().get(url).send().await?;
+        Self::get_data_from_response_checked(response).await
     }
 
     async fn get_info_from_catalog_test(&self, request: StorageRequest) -> Result<RequestParams> {
@@ -130,7 +168,10 @@ impl StorageClientImpl {
                 return Err(anyhow!("Only table request is supported."));
             }
         };
-        let keys = vec![TABLE_FILE_MAP.get(table_id).unwrap().to_string()];
+        let keys = vec![TABLE_FILE_MAP
+            .get(table_id)
+            .ok_or_else(|| anyhow!("Unknown table {table_id}"))?
+            .to_string()];
         Ok(RequestParams::MockS3((bucket, keys)))
     }
 
@@ -209,9 +250,13 @@ impl StorageClient for StorageClientImpl {
         Self::get_data_from_response(response).await
     }
 
-    // TODO (kunle): I don't think this function is necessary.
-    async fn request_data_sync(&self, _request: StorageRequest) -> Result<Vec<RecordBatch>> {
-        todo!()
+    async fn request_data_sync(&self, request: StorageRequest) -> Result<Vec<RecordBatch>> {
+        let mut receiver = self.request_data(request).await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            batches.push(batch);
+        }
+        Ok(batches)
     }
 }
 

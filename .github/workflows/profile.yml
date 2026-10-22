@@ -1,0 +1,29 @@
+name: Profile frozen Parquet HTTP path
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Install native syscall diagnostic
+        run: command -v strace || { sudo apt-get update && sudo apt-get install -y strace; }
+      - run: cargo +1.99.1 build --release --locked --jobs 2 -p storage-node --example verify_server -p parpulse-client --example benchmark
+      - name: Record diagnostic environment
+        run: |
+          mkdir -p .audit/profile
+          { git rev-parse HEAD; rustc +1.99.1 -Vv; strace --version; uname -a; lscpu; free -b; df -B1 .; } > .audit/profile/environment.txt
+      - name: Trace server and consumer in separate trials
+        run: |
+          python3 tools/benchmark_parpulse.py --profile server --output .audit/profile/server
+          python3 tools/benchmark_parpulse.py --profile consumer --output .audit/profile/consumer
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parquet-profile-${{ github.run_id }}
+          path: .audit/profile
+          include-hidden-files: true

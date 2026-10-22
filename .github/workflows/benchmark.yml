@@ -1,0 +1,25 @@
+name: Benchmark
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - run: cargo build --release --locked --jobs 2 -p storage-node --example verify_server -p parpulse-client --example benchmark
+      - run: cargo test --locked --jobs 2 -p parpulse-client --example benchmark
+      - name: Record environment
+        run: |
+          mkdir -p .audit/benchmark
+          { git rev-parse HEAD; rustc -Vv; uname -a; lscpu; free -b; df -B1 .; uptime; } > .audit/benchmark/environment.txt
+      - run: python3 tools/benchmark_parpulse.py --output .audit/benchmark/run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parquet-benchmark-${{ github.run_id }}
+          path: .audit/benchmark
+          include-hidden-files: true

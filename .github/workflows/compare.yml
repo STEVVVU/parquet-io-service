@@ -1,0 +1,49 @@
+name: Compare frozen Parquet write buffering
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  RUSTUP_TOOLCHAIN: 1.99.1
+  CARGO_BUILD_JOBS: 2
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt
+      - name: Candidate offline verifier before measurement
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/parpulse-candidate-target
+        run: |
+          test "$(df --output=avail -B1 . | tail -1)" -gt 10737418240
+          cargo +1.99.1 fmt --all -- --check
+          python3 tools/verify_parpulse.py buffered-candidate
+          cargo +1.99.1 test --locked --jobs 2 -p parpulse-client --example benchmark
+          cargo +1.99.1 build --release --locked --jobs 2 -p storage-node --example verify_server -p parpulse-client --example benchmark
+      - name: Independently build frozen baseline with matched package features
+        run: |
+          test "$(df --output=avail -B1 . | tail -1)" -gt 10737418240
+          git fetch --depth=1 origin 9a263808c1a8e6f46b6305881fe8a74a31744f01
+          mkdir -p "$RUNNER_TEMP/parpulse-baseline"
+          git archive --format=tar --output="$RUNNER_TEMP/parpulse-baseline.tar" 9a263808c1a8e6f46b6305881fe8a74a31744f01
+          tar -xf "$RUNNER_TEMP/parpulse-baseline.tar" -C "$RUNNER_TEMP/parpulse-baseline"
+          cd "$RUNNER_TEMP/parpulse-baseline"
+          cargo +1.99.1 build --release --locked --jobs 2 -p storage-node --example verify_server -p parpulse-client --example benchmark --target-dir "$RUNNER_TEMP/parpulse-baseline-target"
+      - name: Record matched environment
+        run: |
+          mkdir -p .audit/compare
+          { git rev-parse HEAD; rustc +1.99.1 -Vv; cargo +1.99.1 -V; uname -a; lscpu; free -b; df -B1 .; uptime; } > .audit/compare/environment.txt
+      - name: Original full matrix, paired consumers and original correctness checks
+        run: python3 tools/benchmark_parpulse.py --binary-dir "$RUNNER_TEMP/parpulse-candidate-target/release/examples" --baseline-consumer "$RUNNER_TEMP/parpulse-baseline-target/release/examples/benchmark" --baseline-source "$RUNNER_TEMP/parpulse-baseline" --baseline-archive "$RUNNER_TEMP/parpulse-baseline.tar" --output .audit/compare/run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parquet-compare-${{ github.run_id }}
+          path: |
+            .audit/compare
+            .audit/verification/buffered-candidate
+          include-hidden-files: true

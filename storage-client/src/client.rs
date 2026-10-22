@@ -107,7 +107,10 @@ impl StorageClientImpl {
         let response = response.error_for_status()?;
         let temp_dir = tempdir()?;
         let file_path = temp_dir.path().join("tmp.parquet");
-        let mut file = tokio::fs::File::create(&file_path).await?;
+        let mut file = tokio::io::BufWriter::with_capacity(
+            256 * 1024,
+            tokio::fs::File::create(&file_path).await?,
+        );
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             file.write_all(&chunk?).await?;

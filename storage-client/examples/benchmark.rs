@@ -81,7 +81,8 @@ async fn read(
     }
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("download.parquet");
-    let mut file = tokio::fs::File::create(&path).await?;
+    let mut file =
+        tokio::io::BufWriter::with_capacity(256 * 1024, tokio::fs::File::create(&path).await?);
     let mut response = client
         .get(source)
         .send()

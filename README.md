@@ -4,6 +4,129 @@ An asynchronous object-to-Arrow I/O service based on the full MIT-licensed CMU 1
 
 The [official showcase](https://15721.courses.cs.cmu.edu/spring2024/project-showcase.html) links [cmu-db/15721-s24-cache1](https://github.com/cmu-db/15721-s24-cache1). This repository retains its complete history, authors and [MIT license](LICENSE), starting at `b4e2bc8f2c2fc3ab7a9b9fa3f8e864e25e9c8c40`. [README.upstream.md](README.upstream.md) preserves the original README. This is an adaptation of that project, not an original-authorship or course-completion claim.
 
+## Contents
+
+- [Run locally](#run-locally)
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [Changes in this adaptation](#changes-in-this-adaptation)
+- [Checked client](#checked-client)
+- [Verification and limits](#verification-and-limits)
+- [Reproduce cache and Parquet measurements](#reproduce-cache-and-parquet-measurements)
+
+## Architecture and execution guide
+
+The retained Parpulse workspace supplies cache stores, S3 readers, and the OLAP client contract. This adaptation adds safer cache identity and publication, a checked stream, and local verification. It does not add authentication or durable cache-index recovery. A [cache key](#cache-key) identifies the object; a [record batch](#record-batch) is the decoded output.
+
+The top-level flow connects the client, HTTP node, cache, source reader, and Parquet decoder.
+
+```mermaid
+flowchart LR
+  N1["OLAP caller"] --> N2["Rust client"]
+  N2["Rust client"] --> N3["HTTP storage node"]
+  N3["HTTP storage node"] --> N4["Manager and cache"]
+  N4["Manager and cache"] -->|"miss"| N5["Fixture or S3 reader"]
+  N5["Fixture or S3 reader"] --> N4["Manager and cache"]
+  N4["Manager and cache"] --> N6["HTTP bytes"]
+  N6["HTTP bytes"] --> N7["Parquet decoder"]
+  N7["Parquet decoder"] --> N8["Arrow batches"]
+```
+
+The request sequence distinguishes cache hits from source reads. Failed reads do not publish final partial files; checked decode errors reach the caller.
+
+```mermaid
+sequenceDiagram
+  participant C as "Client"
+  participant N as "Node"
+  participant M as "Manager"
+  participant R as "Source reader"
+  participant D as "Decoder"
+  C->>N: "Request one object"
+  N->>M: "Build key and look up cache"
+  alt "Hit"
+    M-->>N: "Cached bytes"
+  else "Miss"
+    M->>R: "Read fixture or S3 object"
+    alt "Read succeeds"
+      R-->>M: "Complete bytes"
+      M->>M: "Publish cache entry"
+    else "Read fails"
+      R-->>M: "Error without final partial file"
+      M-->>N: "Request error"
+    end
+  end
+  M-->>N: "Byte stream"
+  N-->>C: "HTTP response"
+  C->>D: "Decode Parquet"
+  D-->>C: "Record batch or error"
+```
+
+| Subsystem | Responsibility and owned state | Source |
+| --- | --- | --- |
+| HTTP node | Parses one-object requests and streams manager responses. | [`server.rs`](storage-node/src/server.rs) |
+| Manager | Builds identity, checks cache, coordinates source reads, and inserts completed bytes. | [`storage_manager.rs`](storage-node/src/storage_manager.rs) |
+| Readers | Reads fixture paths or remote keys through AWS SDK. | [`storage_reader`](storage-node/src/storage_reader) |
+| Cache stores | Holds entries in memory, disk, or SQLite; drop and restart behavior depends on store. | [`cache`](storage-node/src/cache) |
+| Client | Requests bytes and decodes them to Arrow batches; checked API surfaces late errors. | [`storage-client`](storage-client/src) |
+
+Execution journey:
+
+1. The caller builds `RequestParams` with source, bucket, and ordered keys.
+2. The client requests one object through the HTTP node.
+3. The manager makes a [cache key](#cache-key) from source, bucket, count, and framed keys, then checks the store.
+4. On a miss, the fixture reader enforces its fixture root or the S3 reader fetches the key. Read failure leaves no final partial object.
+5. The manager publishes complete bytes and streams them to the client.
+6. The checked client downloads to a temporary file because Parquet metadata is at EOF, then decodes through a bounded channel. Receiver drop stops decode.
+
+| Choice | Current behavior and rationale inferred from code | Alternative and cost to reconsider |
+| --- | --- | --- |
+| Include source and framed keys in identity | Prevents source collisions and ambiguous concatenation. | Joined strings are simpler but can collide. |
+| Publish a complete temporary file | Avoids exposing partial final entries; concurrent disk writers have one winner. | Direct final writes save temporary space but expose partial data after failure. |
+| Bound checked batch channel | Backpressures decode and returns late errors; it does not cap object size. | Unbounded delivery can queue decoded data without limit. |
+| Download before decoding | Provides Parquet's end metadata to the decoder. | Range or incremental reads reduce temporary storage but require another reader design. |
+| Validate for the legacy trait | Preserves its success-only error contract but can hold decoded data proportional to the object. | Changing the trait would break callers. |
+
+These are current tradeoffs, not historical intent. Disk and SQLite stores remove their owned paths on drop and do not rebuild indexes after restart.
+
+<a id="cache-key"></a>
+
+<details><summary>What is a cache key?</summary>
+
+A cache key identifies cached bytes. Here it includes source kind, bucket, object count, and length-delimited names, so fixture and remote objects remain distinct.
+
+</details>
+
+<a id="cache-pin"></a>
+
+<details><summary>What is a cache pin?</summary>
+
+A cache pin keeps an entry available while a consumer reads it. Cancelled disk streams release the pin so they do not retain entries indefinitely.
+
+</details>
+
+<a id="record-batch"></a>
+
+<details><summary>What is a record batch?</summary>
+
+An Arrow record batch is a columnar set of rows with a schema. The shipped fixture decodes to 1,000 rows and 13 columns.
+
+</details>
+
+<a id="cache-publication"></a>
+
+<details><summary>What is cache publication?</summary>
+
+Cache publication makes a complete object visible. The disk path uses a same-directory temporary file before publishing.
+
+</details>
+
+<a id="checked-stream"></a>
+
+<details><summary>What is the checked stream?</summary>
+
+The checked stream yields `Result<RecordBatch>` values, so decode errors can reach the caller after startup. Its bounded channel does not impose a total object-size limit.
+
+</details>
+
 ## Run locally
 
 Requires Rust 1.99.1, Python 3.11 or later, and a C/C++ toolchain. Windows needs the MSVC Build Tools. SQLite is built from its bundled source. The application lockfile pins dependencies, including Chrono 0.4.34 for Arrow 50 compatibility.

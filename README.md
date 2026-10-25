@@ -16,6 +16,371 @@ The [official showcase](https://15721.courses.cs.cmu.edu/spring2024/project-show
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Request one object by bucket and key through the HTTP /file route when that object is not yet cached.
+
+**Trace.** [Parse one-object HTTP request](#flow-step-http-parse) → [Hash identity and select shard](#flow-step-cache-identity-shard) → [Read cache or take miss path](#flow-step-cache-lookup) → [Coalesce same-key fill and read source](#flow-step-singleflight-source) → [Buffer and admit memory or disk](#flow-step-tier-admit) → [Publish complete cache entry](#flow-step-cache-publish) → [Stream cached bytes with bounded channels](#flow-step-cache-deliver) → [Return receiver as HTTP body stream](#flow-step-http-stream).
+
+**Result and boundary.** The source object is streamed into the configured memory or disk cache and returned as an HTTP body; cache data files may be atomically published, while the cache index/status remains process-local and is not durable across restart.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why frame source kind, key count, bucket, and keys before hashing the cache identity?** Framing keeps distinct source and key sequences from ambiguously producing the same identity; it adds deterministic byte encoding before the hash.
+
+[Source-framed cache identity](#technique-source-framed-cache-key).
+
+**Why coalesce a same-key cache fill and stream objects in order?** One owner performs a given miss fill while waiters share its result, avoiding redundant same-key source reads; sequential streaming preserves request order but an object error ends the stream without retry.
+
+[Per-key single-flight cache fill](#technique-singleflight-cache-fill) · [Ordered multi-object source streaming](#technique-ordered-object-streaming).
+
+</details>
+
+#### Primary execution flow
+
+The /file route accepts one object, routes through identity/shard and cache lookup/fill, then streams bytes for client Parquet decoding.
+
+```mermaid
+flowchart TD
+    n1["1. Parse one-object HTTP request"]
+    click n1 href "https://github.com/STEVVVU/parquet-io-service#flow-step-http-parse" "Open step, techniques, and source" _top
+    n2["2. Hash identity and select<br/>shard"]
+    click n2 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-identity-shard" "Open step, techniques, and source" _top
+    n3["3. Read cache or take miss path"]
+    click n3 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-lookup" "Open step, techniques, and source" _top
+    n4["4. Coalesce same-key fill and<br/>read source"]
+    click n4 href "https://github.com/STEVVVU/parquet-io-service#flow-step-singleflight-source" "Open step, techniques, and source" _top
+    n5["5. Buffer and admit memory or<br/>disk"]
+    click n5 href "https://github.com/STEVVVU/parquet-io-service#flow-step-tier-admit" "Open step, techniques, and source" _top
+    n6["6. Publish complete cache entry"]
+    click n6 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-publish" "Open step, techniques, and source" _top
+    n7["7. Stream cached bytes with<br/>bounded channels"]
+    click n7 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-deliver" "Open step, techniques, and source" _top
+    n10["10. Return receiver as HTTP body<br/>stream"]
+    click n10 href "https://github.com/STEVVVU/parquet-io-service#flow-step-http-stream" "Open step, techniques, and source" _top
+    n11["11. Download object then decode<br/>checked batches"]
+    click n11 href "https://github.com/STEVVVU/parquet-io-service#flow-step-client-checked" "Open step, techniques, and source" _top
+    n1 -->|"parsed RequestParams"| n2
+    n2 -->|"selected cache and request"| n3
+    n3 -->|"cache miss"| n4
+    n4 -->|"source byte stream"| n5
+    n5 -->|"disk spill completes"| n6
+    n6 -->|"fill complete then relookup"| n7
+    n3 -->|"cache hit receiver"| n7
+    n7 -->|"byte receiver"| n10
+    n10 -->|"HTTP response bytes"| n11
+    n5 -->|"Memory admission succeeds without disk<br/>publication"| n7
+```
+
+**Detailed workflows.** [HTTP request through cache and stream](#flow-workflow-request-cache-delivery) · [Construct cache and replacement alternatives](#flow-workflow-configuration-alternatives) · [Fill admission, replacement and stream failures](#flow-workflow-fill-read-failures).
+
+<a id="flow-workflow-request-cache-delivery"></a>
+
+<details>
+<summary>HTTP request through cache and stream</summary>
+
+Actual service path from Warp query parsing to either cache hit or source fill and response body. S3 and fixture reader selection depends on is_test; no application semaphore is present.
+
+```mermaid
+flowchart TD
+    n1["1. Parse one-object HTTP request"]
+    click n1 href "https://github.com/STEVVVU/parquet-io-service#flow-step-http-parse" "Open step, techniques, and source" _top
+    n2["2. Hash identity and select<br/>shard"]
+    click n2 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-identity-shard" "Open step, techniques, and source" _top
+    n3["3. Read cache or take miss path"]
+    click n3 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-lookup" "Open step, techniques, and source" _top
+    n4["4. Coalesce same-key fill and<br/>read source"]
+    click n4 href "https://github.com/STEVVVU/parquet-io-service#flow-step-singleflight-source" "Open step, techniques, and source" _top
+    n5["5. Buffer and admit memory or<br/>disk"]
+    click n5 href "https://github.com/STEVVVU/parquet-io-service#flow-step-tier-admit" "Open step, techniques, and source" _top
+    n6["6. Publish complete cache entry"]
+    click n6 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-publish" "Open step, techniques, and source" _top
+    n7["7. Stream cached bytes with<br/>bounded channels"]
+    click n7 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-deliver" "Open step, techniques, and source" _top
+    n10["10. Return receiver as HTTP body<br/>stream"]
+    click n10 href "https://github.com/STEVVVU/parquet-io-service#flow-step-http-stream" "Open step, techniques, and source" _top
+    n11["11. Download object then decode<br/>checked batches"]
+    click n11 href "https://github.com/STEVVVU/parquet-io-service#flow-step-client-checked" "Open step, techniques, and source" _top
+    n1 -->|"parsed RequestParams"| n2
+    n2 -->|"selected cache and request"| n3
+    n3 -->|"cache miss"| n4
+    n4 -->|"source byte stream"| n5
+    n5 -->|"disk spill completes"| n6
+    n6 -->|"fill complete then relookup"| n7
+    n3 -->|"cache hit receiver"| n7
+    n7 -->|"byte receiver"| n10
+    n10 -->|"HTTP response bytes"| n11
+    n5 -->|"Memory admission succeeds without disk<br/>publication"| n7
+```
+
+</details>
+
+<a id="flow-workflow-configuration-alternatives"></a>
+
+<details>
+<summary>Construct cache and replacement alternatives</summary>
+
+Service startup selects backend and replacement policy. SQLite replaces the MemDisk path; there is no handoff from MemDisk into SQLite.
+
+```mermaid
+flowchart TD
+    n13["13. Construct selected cache and<br/>policy"]
+    click n13 href "https://github.com/STEVVVU/parquet-io-service#flow-step-configure-cache" "Open step, techniques, and source" _top
+    n1["1. Parse one-object HTTP request"]
+    click n1 href "https://github.com/STEVVVU/parquet-io-service#flow-step-http-parse" "Open step, techniques, and source" _top
+    n2["2. Hash identity and select<br/>shard"]
+    click n2 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-identity-shard" "Open step, techniques, and source" _top
+    n3["3. Read cache or take miss path"]
+    click n3 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-lookup" "Open step, techniques, and source" _top
+    n8["8. SQLite blob cache path"]
+    click n8 href "https://github.com/STEVVVU/parquet-io-service#flow-step-sqlite-path" "Open step, techniques, and source" _top
+    n9["9. Evict unpinned cache entries"]
+    click n9 href "https://github.com/STEVVVU/parquet-io-service#flow-step-replacement" "Open step, techniques, and source" _top
+    n10["10. Return receiver as HTTP body<br/>stream"]
+    click n10 href "https://github.com/STEVVVU/parquet-io-service#flow-step-http-stream" "Open step, techniques, and source" _top
+    n14["14. Propagate source failure"]
+    click n14 href "https://github.com/STEVVVU/parquet-io-service#flow-step-source-error" "Open step, techniques, and source" _top
+    n15["15. Terminate failed body or<br/>checked decode"]
+    click n15 href "https://github.com/STEVVVU/parquet-io-service#flow-step-stream-error" "Open step, techniques, and source" _top
+    n13 -->|"All backend and policy branches call<br/>route with the constructed manager"| n1
+    n1 -->|"Parsed request reaches manager"| n2
+    n2 -->|"Hash selects configured cache"| n3
+    n3 -->|"Configured SqliteStoreCache trait<br/>dispatch performs lookup or fill"| n8
+    n8 -->|"After complete BLOB write, insert into<br/>configured replacer"| n9
+    n8 -->|"Hit or successful fill and second<br/>lookup returns BLOB receiver"| n10
+    n8 -.->|"data_stream item error propagates<br/>before replacer publication"| n14
+    n8 -.->|"Spawned read task unwraps<br/>open/reader/send; errors can panic<br/>task"| n15
+```
+
+</details>
+
+<a id="flow-workflow-fill-read-failures"></a>
+
+<details>
+<summary>Fill admission, replacement and stream failures</summary>
+
+MemDisk memory admission can finish without disk publication. Source errors and cache-read errors have distinct terminals.
+
+```mermaid
+flowchart TD
+    n4["4. Coalesce same-key fill and<br/>read source"]
+    click n4 href "https://github.com/STEVVVU/parquet-io-service#flow-step-singleflight-source" "Open step, techniques, and source" _top
+    n5["5. Buffer and admit memory or<br/>disk"]
+    click n5 href "https://github.com/STEVVVU/parquet-io-service#flow-step-tier-admit" "Open step, techniques, and source" _top
+    n9["9. Evict unpinned cache entries"]
+    click n9 href "https://github.com/STEVVVU/parquet-io-service#flow-step-replacement" "Open step, techniques, and source" _top
+    n6["6. Publish complete cache entry"]
+    click n6 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-publish" "Open step, techniques, and source" _top
+    n7["7. Stream cached bytes with<br/>bounded channels"]
+    click n7 href "https://github.com/STEVVVU/parquet-io-service#flow-step-cache-deliver" "Open step, techniques, and source" _top
+    n14["14. Propagate source failure"]
+    click n14 href "https://github.com/STEVVVU/parquet-io-service#flow-step-source-error" "Open step, techniques, and source" _top
+    n15["15. Terminate failed body or<br/>checked decode"]
+    click n15 href "https://github.com/STEVVVU/parquet-io-service#flow-step-stream-error" "Open step, techniques, and source" _top
+    n11["11. Download object then decode<br/>checked batches"]
+    click n11 href "https://github.com/STEVVVU/parquet-io-service#flow-step-client-checked" "Open step, techniques, and source" _top
+    n12["12. Adapt checked batches to<br/>legacy success-only stream"]
+    click n12 href "https://github.com/STEVVVU/parquet-io-service#flow-step-client-legacy" "Open step, techniques, and source" _top
+    n4 -->|"Valid source chunks feed admission"| n5
+    n4 -.->|"S3 fetch/body Err ends stream; fixture<br/>Err propagates through fill"| n14
+    n5 -.->|"Source error clears fill state and<br/>wakes waiters"| n14
+    n5 -->|"Memory insertion calls configured<br/>replacer; failure spills to disk"| n9
+    n9 -->|"Evicted memory bytes are written to<br/>disk before disk replacer insertion"| n6
+    n5 -->|"Successful memory admission is read<br/>without disk publication"| n7
+    n6 -->|"Successful fill triggers cache<br/>relookup"| n7
+    n7 -.->|"Disk read Err is sent once then sender<br/>exits and unpins"| n15
+    n12 -->|"Legacy method invokes checked decoder<br/>and consumes every result"| n11
+    n11 -.->|"Download errors return Err; blocking<br/>decode sends Err and drops temporary<br/>directory"| n15
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-http-parse"></a>
+
+##### 1. Parse one-object HTTP request
+
+**Component.** server::route. Warp matches /file and parses S3Request. It wraps the scalar key into a one-key S3 or MockS3 request; there is no app semaphore or request permit.
+
+**Techniques at this step.** [HTTP query parsing and single-object admission](#technique-http-query-single-object-admission).
+
+**Source.** [`storage-node/src/server.rs:28`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/server.rs#L28). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-cache-identity-shard"></a>
+
+##### 2. Hash identity and select shard
+
+**Component.** cache_key_from_request / StorageManagerImpl. SHA-256 frames source kind, key count, bucket, and each key by byte length. CRC32 selects one cache vector entry by modulo.
+
+**Techniques at this step.** [Source-framed cache identity](#technique-source-framed-cache-key) · [Hash-sharded cache selection](#technique-hash-sharded-cache-selection).
+
+**Source.** [`storage-node/src/cache/data_store_cache/mod.rs:26`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/mod.rs#L26) · [`storage-node/src/storage_manager.rs:36`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/storage_manager.rs#L36). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-cache-lookup"></a>
+
+##### 3. Read cache or take miss path
+
+**Component.** StorageManagerImpl::get_data. The selected cache is queried first. A receiver returns immediately on hit; a miss invokes put_data_to_cache, then re-reads the cache and panics if the expected entry is absent.
+
+This is the orchestration branch joining cache hit and fill results.
+
+**Source.** [`storage-node/src/storage_manager.rs:59`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/storage_manager.rs#L59). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-singleflight-source"></a>
+
+##### 4. Coalesce same-key fill and read source
+
+**Component.** MemDiskStoreCache::put_data_to_cache. An Incompleted key registers a waiter on Notify; the owner marks the key Incompleted and opens S3 or validated fixture stream. Source object keys are fetched sequentially; an S3 or body-stream error terminates that stream, with no retry.
+
+**Techniques at this step.** [Per-key single-flight cache fill](#technique-singleflight-cache-fill) · [Ordered multi-object source streaming](#technique-ordered-object-streaming) · [Canonical fixture-root validation](#technique-fixture-root-validation).
+
+**Source.** [`storage-node/src/cache/data_store_cache/memdisk/mod.rs:284`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/memdisk/mod.rs#L284) · [`storage-node/src/storage_reader/s3.rs:101`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/storage_reader/s3.rs#L101) · [`storage-node/src/storage_reader/s3_diskmock.rs:61`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/storage_reader/s3_diskmock.rs#L61). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-tier-admit"></a>
+
+##### 5. Buffer and admit memory or disk
+
+**Component.** MemStore::write_data / MemDiskStoreCache. Chunks enter memory until the configured file threshold is exceeded; then accumulated chunks and remaining source stream are written to disk. With memory disabled the stream goes directly to disk. Per-key fill status coordinates waiters; failed fills clear in-progress state and notify waiters.
+
+**Techniques at this step.** [Memory-to-disk cache admission](#technique-tiered-cache-admission) · [Complete-file cache publication](#technique-atomic-complete-file-publication).
+
+**Source.** [`storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs:59`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L59) · [`storage-node/src/cache/data_store_cache/memdisk/mod.rs:360`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/memdisk/mod.rs#L360) · [`storage-node/src/disk/disk_manager.rs:89`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/disk/disk_manager.rs#L89). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-cache-publish"></a>
+
+##### 6. Publish complete cache entry
+
+**Component.** DiskManager::write_bytes_and_stream_to_disk. Disk writes use a temporary file in the destination directory, flush and sync it, then persist_noclobber to the final key. This protects the final path from partial writes; it does not make the process-local cache index durable or recoverable after restart.
+
+**Techniques at this step.** [Complete-file cache publication](#technique-atomic-complete-file-publication).
+
+**Source.** [`storage-node/src/disk/disk_manager.rs:89`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/disk/disk_manager.rs#L89). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-cache-deliver"></a>
+
+##### 7. Stream cached bytes with bounded channels
+
+**Component.** MemStore::read_data / DiskStore::read_data. Memory sends cloned chunks through capacity 1024; disk caps the read buffer and sends through capacity 512. Reader completion or send/read failure ends the task and releases its replacement pin; disk reads are sequential byte-range reads.
+
+**Techniques at this step.** [Bounded cache stream delivery and pin lifetime](#technique-bounded-cache-streams) · [LRU eviction with read pins](#technique-lru-pinned-eviction).
+
+**Source.** [`storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs:30`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L30) · [`storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs:58`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs#L58). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-sqlite-path"></a>
+
+##### 8. SQLite blob cache path
+
+**Component.** SqliteStoreCache / SqliteBlobReader. SQLite fill opens an ordered S3 or fixture source, allocates ZEROBLOB from the reported size (512 MiB fallback on size error), writes chunks, then inserts its in-memory replacer entry. Reads spawn a capacity-five incremental BLOB channel. Open, BLOB-reader creation and send use unwrap, so disconnect or setup failure can panic the spawned task; no read-pin lifecycle is implemented here. Drop deletes the database.
+
+**Techniques at this step.** [SQLite incremental BLOB reads](#technique-sqlite-blob-streaming) · [Bounded cache stream delivery and pin lifetime](#technique-bounded-cache-streams).
+
+**Source.** [`storage-node/src/cache/data_store_cache/sqlite/mod.rs:103`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/sqlite/mod.rs#L103) · [`storage-node/src/cache/data_store_cache/sqlite/blob.rs:38`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/data_store_cache/sqlite/blob.rs#L38). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-replacement"></a>
+
+##### 9. Evict unpinned cache entries
+
+**Component.** LruReplacer::put_value / LruKReplacer::evict. LRU chooses the least-recent eligible entry; LRU-K uses access history and prefers entries with fewer than k accesses as infinite backward distance. Pinned entries are skipped; if no candidate exists eviction can fail.
+
+**Techniques at this step.** [LRU eviction with read pins](#technique-lru-pinned-eviction) · [LRU-K history-based eviction](#technique-lru-k-history-eviction).
+
+**Source.** [`storage-node/src/cache/replacer/lru.rs:38`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/replacer/lru.rs#L38) · [`storage-node/src/cache/replacer/lru_k.rs:52`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/cache/replacer/lru_k.rs#L52). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-http-stream"></a>
+
+##### 10. Return receiver as HTTP body stream
+
+**Component.** server::route. Successful manager response becomes ReceiverStream wrapped in Hyper body and HTTP 200. Manager errors become HTTP 500 text; client disconnect drops the body/receiver and bounded sender eventually sees a closed channel, ending its send loop.
+
+This is HTTP transport of the cache receiver and its implemented error response.
+
+**Source.** [`storage-node/src/server.rs:54`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/server.rs#L54). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-client-checked"></a>
+
+##### 11. Download object then decode checked batches
+
+**Component.** StorageClientImpl::request_object_checked / get_data_from_response_checked. Checked API enforces exactly one nonempty bucket/key, sends GET, validates HTTP status, and streams response chunks into a temporary Parquet file. After flush it decodes in spawn_blocking into bounded capacity-32 channel; decode failures are sent as Err and receiver closure stops production. Dropping receiver stops further sends; temp directory is removed when decoder exits.
+
+**Techniques at this step.** [Temporary-file Parquet decode with bounded backpressure](#technique-temp-file-parquet-decode-backpressure).
+
+**Source.** [`storage-client/src/client.rs:144`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-client/src/client.rs#L144) · [`storage-client/src/client.rs:104`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-client/src/client.rs#L104). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-client-legacy"></a>
+
+##### 12. Adapt checked batches to legacy success-only stream
+
+**Component.** StorageClientImpl::get_data_from_response / request_data_sync. The legacy adapter consumes every checked result before exposing rows, propagating any late decode error as an upfront error. It then spawns a bounded channel producer for batches; sync convenience collects all batches into a Vec.
+
+**Techniques at this step.** [Legacy success-only stream adapter](#technique-legacy-error-compatible-adapter).
+
+**Source.** [`storage-client/src/client.rs:86`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-client/src/client.rs#L86) · [`storage-client/src/client.rs:256`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-client/src/client.rs#L256). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-configure-cache"></a>
+
+##### 13. Construct selected cache and policy
+
+**Component.** storage_node_serve. storage_node_serve matches Memdisk, Disk or Sqlite, then Lru or Lruk. Disk uses MemDiskStoreCache without memory; SQLite owns a BLOB database and replacer. Each branch constructs cache shards and passes a StorageManager to route.
+
+This stage records the concrete configuration branch or terminal result of the cited operation.
+
+**Source.** [`storage-node/src/server.rs:100`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/server.rs#L100). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-source-error"></a>
+
+##### 14. Propagate source failure
+
+**Component.** poll_next. S3 request or body error clears stream state and prevents later objects. Fixture open/read errors yield Err; fill callers propagate that error rather than retrying. MemDisk clears in-progress state and notifies its waiters.
+
+This stage records the concrete configuration branch or terminal result of the cited operation.
+
+**Source.** [`storage-node/src/storage_reader/s3.rs:109`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-node/src/storage_reader/s3.rs#L109). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-stream-error"></a>
+
+##### 15. Terminate failed body or checked decode
+
+**Component.** get_data_from_response_checked. A cache receiver Err becomes a Hyper body error after HTTP headers. The checked client returns transport/status/download failures upfront and sends decode errors through its Result channel; the legacy adapter consumes those errors before exposing batches.
+
+This stage records the concrete configuration branch or terminal result of the cited operation.
+
+**Source.** [`storage-client/src/client.rs:107`](https://github.com/STEVVVU/parquet-io-service/blob/parpulse/storage-client/src/client.rs#L107). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Storage-node /file request through cache/source/stream and checked or legacy storage-client decode; configured memdisk and SQLite backing paths. HTTP route has no semaphore. Cache data files are staged and published atomically, but cache index/status is process-local and not durable across restart.
+
+- **Request identity and cache admission.** Framed identity, hash shard, hit/miss orchestration. [Step 2](#flow-step-cache-identity-shard), [Step 3](#flow-step-cache-lookup).
+- **Memory, disk, and SQLite cache paths.** Single-flight fill, threshold admission, bounded reads and SQLite incremental blobs. [Step 4](#flow-step-singleflight-source), [Step 5](#flow-step-tier-admit), [Step 6](#flow-step-cache-publish), [Step 7](#flow-step-cache-deliver), [Step 8](#flow-step-sqlite-path).
+- **Cache replacement policy.** LRU and LRU-K skip pinned entries; behavior depends on configured policy. [Step 9](#flow-step-replacement), [Step 7](#flow-step-cache-deliver), [Step 8](#flow-step-sqlite-path).
+- **Source reads and complete-file publication.** Ordered S3/mock source streams, fixture path validation, atomic disk file publication. [Step 4](#flow-step-singleflight-source), [Step 5](#flow-step-tier-admit), [Step 6](#flow-step-cache-publish).
+- **HTTP admission and response stream.** Single-key query mapping and receiver body; no route semaphore exists. [Step 1](#flow-step-http-parse), [Step 10](#flow-step-http-stream).
+- **Parquet client and compatibility adapter.** Checked tempfile decode and legacy success-only compatibility. [Step 11](#flow-step-client-checked), [Step 12](#flow-step-client-legacy).
+
+Outside this flow audit:
+
+- `storage-node/src/bin/storage_node.rs deployment wrapper`. Deployment and credentials setup excluded from active runtime path.
+- `README.upstream.md and standalone scripts`. Archived docs and inactive utilities are not runtime mechanisms.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -47,6 +412,8 @@ flowchart LR
 The retained Parpulse workspace supplies cache stores, S3 readers, and the OLAP client contract. This adaptation adds safer cache identity and publication, a checked stream, and local verification. It does not add authentication or durable cache-index recovery. A [cache key](#cache-key) identifies the object; a [record batch](#record-batch) is the decoded output.
 
 The top-level flow connects the client, HTTP node, cache, source reader, and Parquet decoder.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>

@@ -16,9 +16,40 @@ The [official showcase](https://15721.courses.cs.cmu.edu/spring2024/project-show
 
 ## Architecture and execution guide
 
+### Subsystem map
+
+Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
+
+```mermaid
+flowchart LR
+  system["Parquet I/O service"]
+  system --> s1["1. Request identity and cache<br/>admission"]
+  click s1 href "https://github.com/STEVVVU/parquet-io-service#subsystem-request-identity-and-cache-admission" "Explore Request identity and cache admission" _top
+  system --> s2["2. Memory, disk, and SQLite cache<br/>paths"]
+  click s2 href "https://github.com/STEVVVU/parquet-io-service#subsystem-memory-disk-and-sqlite-cache-paths" "Explore Memory, disk, and SQLite cache paths" _top
+  system --> s3["3. Cache replacement policy"]
+  click s3 href "https://github.com/STEVVVU/parquet-io-service#subsystem-cache-replacement-policy" "Explore Cache replacement policy" _top
+  system --> s4["4. Source reads and complete-file<br/>publication"]
+  click s4 href "https://github.com/STEVVVU/parquet-io-service#subsystem-source-reads-and-complete-file-publication" "Explore Source reads and complete-file publication" _top
+  system --> s5["5. HTTP admission and response<br/>stream"]
+  click s5 href "https://github.com/STEVVVU/parquet-io-service#subsystem-http-admission-and-response-stream" "Explore HTTP admission and response stream" _top
+  system --> s6["6. Parquet client and<br/>compatibility adapter"]
+  click s6 href "https://github.com/STEVVVU/parquet-io-service#subsystem-parquet-client-and-compatibility-adapter" "Explore Parquet client and compatibility adapter" _top
+```
+
+1. [Request identity and cache admission](#subsystem-request-identity-and-cache-admission)
+2. [Memory, disk, and SQLite cache paths](#subsystem-memory-disk-and-sqlite-cache-paths)
+3. [Cache replacement policy](#subsystem-cache-replacement-policy)
+4. [Source reads and complete-file publication](#subsystem-source-reads-and-complete-file-publication)
+5. [HTTP admission and response stream](#subsystem-http-admission-and-response-stream)
+6. [Parquet client and compatibility adapter](#subsystem-parquet-client-and-compatibility-adapter)
+
 The retained Parpulse workspace supplies cache stores, S3 readers, and the OLAP client contract. This adaptation adds safer cache identity and publication, a checked stream, and local verification. It does not add authentication or durable cache-index recovery. A [cache key](#cache-key) identifies the object; a [record batch](#record-batch) is the decoded output.
 
 The top-level flow connects the client, HTTP node, cache, source reader, and Parquet decoder.
+
+<details>
+<summary>Expand flow diagram 1</summary>
 
 ```mermaid
 flowchart LR
@@ -32,7 +63,12 @@ flowchart LR
   N7["Parquet decoder"] --> N8["Arrow batches"]
 ```
 
+</details>
+
 The request sequence distinguishes cache hits from source reads. Failed reads do not publish final partial files; checked decode errors reach the caller.
+
+<details>
+<summary>Expand flow diagram 2</summary>
 
 ```mermaid
 sequenceDiagram
@@ -60,6 +96,8 @@ sequenceDiagram
   C->>D: "Decode Parquet"
   D-->>C: "Record batch or error"
 ```
+
+</details>
 
 | Subsystem | Responsibility and owned state | Source |
 | --- | --- | --- |
@@ -125,6 +163,384 @@ Cache publication makes a complete object visible. The disk path uses a same-dir
 <details><summary>What is the checked stream?</summary>
 
 The checked stream yields `Result<RecordBatch>` values, so decode errors can reach the caller after startup. Its bounded channel does not impose a total object-size limit.
+
+</details>
+
+## Implementation techniques
+
+This section covers active storage-node cache, source-reader, HTTP, and client paths in this adaptation. The explanations describe current code; design rationale is inferred from its behavior.
+
+<details>
+<summary>Full technique index</summary>
+
+| Active subsystem | Technique cards | Source |
+| --- | --- | --- |
+| Request identity and cache selection | [Source-framed cache identity](#technique-source-framed-cache-key), [Hash-sharded cache selection](#technique-hash-sharded-cache-selection) | [cache key](storage-node/src/cache/data_store_cache/mod.rs#L26), [manager](storage-node/src/storage_manager.rs#L36) |
+| Cache fill and memory/disk tiers | [Per-key single-flight fill](#technique-singleflight-cache-fill), [Memory-to-disk admission](#technique-tiered-cache-admission), [Bounded cache streams and pins](#technique-bounded-cache-streams) | [mem-disk cache](storage-node/src/cache/data_store_cache/memdisk/mod.rs#L216), [memory store](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L30), [disk store](storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs#L58) |
+| Cache replacement and SQLite | [LRU pin-aware eviction](#technique-lru-pinned-eviction), [LRU-K history eviction](#technique-lru-k-history-eviction), [SQLite incremental BLOB reads](#technique-sqlite-blob-streaming) | [LRU](storage-node/src/cache/replacer/lru.rs#L28), [LRU-K](storage-node/src/cache/replacer/lru_k.rs#L52), [SQLite](storage-node/src/cache/data_store_cache/sqlite/mod.rs#L103), [blob reader](storage-node/src/cache/data_store_cache/sqlite/blob.rs#L38) |
+| Source reading and disk publication | [Ordered object streaming](#technique-ordered-object-streaming), [Fixture-root validation](#technique-fixture-root-validation), [Complete-file publication](#technique-atomic-complete-file-publication) | [S3 reader](storage-node/src/storage_reader/s3.rs#L101), [fixture reader](storage-node/src/storage_reader/s3_diskmock.rs#L61), [disk writer](storage-node/src/disk/disk_manager.rs#L89) |
+| HTTP request handling | [Single-object HTTP query admission](#technique-http-query-single-object-admission) | [route](storage-node/src/server.rs#L28) |
+| Client decode and compatibility | [Temporary-file decode and backpressure](#technique-temp-file-parquet-decode-backpressure), [Legacy success-only adapter](#technique-legacy-error-compatible-adapter) | [client](storage-client/src/client.rs#L86) |
+
+</details>
+
+<a id="subsystem-request-identity-and-cache-admission"></a>
+
+### 1. Request identity and cache admission
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`storage-node/src/cache/data_store_cache/mod.rs`](storage-node/src/cache/data_store_cache/mod.rs), [`storage-node/src/storage_manager.rs`](storage-node/src/storage_manager.rs).
+
+**Techniques.** [Source-framed cache identity](#technique-source-framed-cache-key), [Hash-sharded cache selection](#technique-hash-sharded-cache-selection).
+
+<a id="technique-source-framed-cache-key"></a>
+
+<details>
+<summary>Source-framed cache identity</summary>
+
+**Mechanism.** `cache_key_from_request` hashes a source-kind byte, the key count, then each bucket and key as a big-endian byte length followed by UTF-8 bytes. The SHA-256 digest is rendered as lowercase hex. For example, `MockS3("tests-parquet", ["a.parquet"])` receives a different identity from `S3` with the same names.
+
+**Example.** A bucket `ab` plus key `c` hashes as framed parts, so it cannot be confused with bucket `a` plus key `bc`.
+
+**Why here.** The manager uses the digest for cache lookup and filenames, so source and component boundaries must remain distinct.
+
+**Tradeoffs.** The digest hides readable request names and adds hashing work. It avoids delimiter ambiguity and request-derived path components.
+
+**Code and ownership.** [`cache_key_from_request`](storage-node/src/cache/data_store_cache/mod.rs#L26). Extension.
+
+
+
+**Used in.** [Request identity and cache admission](#subsystem-request-identity-and-cache-admission). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-hash-sharded-cache-selection"></a>
+
+<details>
+<summary>Hash-sharded cache selection</summary>
+
+**Mechanism.** `StorageManagerImpl::get_data` hashes the framed key with CRC32 and selects one cache from its vector using the remainder. It checks that shard, fills it on a miss, then opens the cached stream.
+
+**Example.** `index = crc32(cache_key) % caches.len()` chooses the cache handling a request.
+
+**Why here.** The manager shares work across multiple independently synchronized cache instances without a manager-wide lock.
+
+**Tradeoffs.** Every request for one key reaches the same shard, but a hot key remains concentrated there. The implementation assumes the cache vector is nonempty.
+
+**Code and ownership.** [`StorageManagerImpl::get_data`](storage-node/src/storage_manager.rs#L36). Inherited.
+
+
+
+**Used in.** [Request identity and cache admission](#subsystem-request-identity-and-cache-admission). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-memory-disk-and-sqlite-cache-paths"></a>
+
+### 2. Memory, disk, and SQLite cache paths
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`storage-node/src/cache/data_store_cache/memdisk/mod.rs`](storage-node/src/cache/data_store_cache/memdisk/mod.rs), [`storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs`](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs), [`storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs`](storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs), [`storage-node/src/cache/data_store_cache/sqlite/mod.rs`](storage-node/src/cache/data_store_cache/sqlite/mod.rs), [`storage-node/src/cache/data_store_cache/sqlite/blob.rs`](storage-node/src/cache/data_store_cache/sqlite/blob.rs).
+
+**Techniques.** [Per-key single-flight cache fill](#technique-singleflight-cache-fill), [Memory-to-disk cache admission](#technique-tiered-cache-admission), [Bounded cache stream delivery and pin lifetime](#technique-bounded-cache-streams), [SQLite incremental BLOB reads](#technique-sqlite-blob-streaming), [LRU eviction with read pins](#technique-lru-pinned-eviction).
+
+**Related concepts.** [cache key](#cache-key).
+
+<a id="technique-singleflight-cache-fill"></a>
+
+<details>
+<summary>Per-key single-flight cache fill</summary>
+
+**Mechanism.** The mem-disk cache records an `Incompleted` state and a notifier by cache key before reading the source. A concurrent fill increments the waiter count and awaits notification. The completing task stores the size and completed tier before waking waiters. A source error removes the pending state and wakes waiters with a failed fill.
+
+**Example.** Two simultaneous misses for one object share the first source read; the second call waits for its result instead of starting another read.
+
+**Why here.** A slow object fetch can otherwise multiply source traffic for identical concurrent requests.
+
+**Tradeoffs.** Waiters depend on the fill path removing pending state on every error. This coordination is per cache instance and does not coordinate separate processes.
+
+**Code and ownership.** [`MemDiskStoreCache::put_data_to_cache`](storage-node/src/cache/data_store_cache/memdisk/mod.rs#L284). Inherited.
+
+
+
+**Used in.** [Memory, disk, and SQLite cache paths](#subsystem-memory-disk-and-sqlite-cache-paths). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-tiered-cache-admission"></a>
+
+<details>
+<summary>Memory-to-disk cache admission</summary>
+
+**Mechanism.** The cache streams source chunks into memory while tracking total bytes. If the per-file memory threshold is crossed, it removes the partial memory entry, carries the accumulated chunks to disk, then appends the remaining source stream. If the memory replacer cannot admit the completed item, it also falls back to disk.
+
+**Example.** With a 10-byte threshold, chunks of 4, 4, and 4 bytes exceed the limit. The first 12 bytes move to the disk writer before later chunks.
+
+**Why here.** Small objects can be served from memory while larger ones avoid occupying the memory tier.
+
+**Tradeoffs.** A crossing object temporarily retains the accumulated chunks while disk publication proceeds. Disk-only and SQLite configurations use different paths.
+
+**Code and ownership.** [`MemDiskStoreCache::put_data_to_cache`](storage-node/src/cache/data_store_cache/memdisk/mod.rs#L284), [`MemStore::write_data`](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L59). Inherited.
+
+
+
+**Used in.** [Memory, disk, and SQLite cache paths](#subsystem-memory-disk-and-sqlite-cache-paths). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-bounded-cache-streams"></a>
+
+<details>
+<summary>Bounded cache streams and pin lifetime</summary>
+
+**Mechanism.** Disk and memory readers send chunks through bounded Tokio channels. A disk reader caps its read buffer by the configured maximum. The replacer pins a cached entry while a stream consumes it; the disk task unpins after completion, receiver closure, or read failure. Memory delivery clones the stored chunk references and unpins after sending.
+
+**Example.** The disk reader uses at most `min(file_size, max_disk_reader_buffer_size)` as its read buffer and a 512-item channel.
+
+**Why here.** Bounded channels let downstream reads slow producers and pins prevent eviction during active access.
+
+**Tradeoffs.** The channel capacity is measured in chunks, not bytes. Memory delivery clones its `Vec<Bytes>` for the task, and SQLite uses a separate capacity of five.
+
+**Code and ownership.** [`DiskStore::read_data`](storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs#L58), [`MemStore::read_data`](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L30). Mixed.
+
+
+
+**Used in.** [Memory, disk, and SQLite cache paths](#subsystem-memory-disk-and-sqlite-cache-paths). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-sqlite-blob-streaming"></a>
+
+<details>
+<summary>SQLite incremental BLOB reads</summary>
+
+**Mechanism.** SQLite cache entries store bytes in a BLOB and the replacer maps the cache key to its row ID. A reader opens a read-only connection, reads the BLOB in configured chunks, and sends each chunk through a bounded channel.
+
+**Example.** With a 1,024-byte reader buffer, `SqliteBlobReader` advances through the BLOB without first materializing the full object as one byte vector.
+
+**Why here.** The SQLite backend can serve stored objects through the same receiver-based interface as the memory and disk stores.
+
+**Tradeoffs.** The in-memory replacer index is not reconstructed from the database after process restart. The store's drop handler removes its configured database file.
+
+**Code and ownership.** [`SqliteStoreCache::get_data_from_cache`](storage-node/src/cache/data_store_cache/sqlite/mod.rs#L103), [`SqliteBlobReader`](storage-node/src/cache/data_store_cache/sqlite/blob.rs#L38). Inherited.
+
+
+
+**Used in.** [Memory, disk, and SQLite cache paths](#subsystem-memory-disk-and-sqlite-cache-paths). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-lru-pinned-eviction"></a>
+
+<details>
+<summary>LRU eviction with read pins</summary>
+
+**Mechanism.** The LRU replacer keeps entries in access order. A hit moves the entry to the newest end. Admission scans oldest to newest and removes unpinned entries until the new item's size fits. A pinned entry remains in the cache while a reader uses it.
+
+**Example.** If the oldest 9-byte entry is pinned and a new 2-byte item exceeds capacity, insertion can fail even when later entries are smaller.
+
+**Why here.** Capacity is tracked in bytes, and cache readers need a stable entry during streaming.
+
+**Tradeoffs.** Pinning can prevent admission while enough bytes appear occupied. The policy does not evict pinned data to satisfy capacity.
+
+**Code and ownership.** [`LruReplacer::get_value`](storage-node/src/cache/replacer/lru.rs#L28), [`LruReplacer::put_value`](storage-node/src/cache/replacer/lru.rs#L37), and pin methods at [`lru.rs`](storage-node/src/cache/replacer/lru.rs#L89). Inherited.
+
+
+
+**Used in.** [Memory, disk, and SQLite cache paths](#subsystem-memory-disk-and-sqlite-cache-paths), [Cache replacement policy](#subsystem-cache-replacement-policy). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-cache-replacement-policy"></a>
+
+### 3. Cache replacement policy
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`storage-node/src/cache/replacer/lru.rs`](storage-node/src/cache/replacer/lru.rs), [`storage-node/src/cache/replacer/lru_k.rs`](storage-node/src/cache/replacer/lru_k.rs).
+
+**Techniques.** [LRU-K history-based eviction](#technique-lru-k-history-eviction).
+
+**Shared techniques.** [LRU eviction with read pins](#technique-lru-pinned-eviction).
+
+<a id="technique-lru-k-history-eviction"></a>
+
+<details>
+<summary>LRU-K history-based eviction</summary>
+
+**Mechanism.** The LRU-K replacer records up to K access timestamps per entry. It evicts the unpinned entry with the greatest backward K-distance. Entries with fewer than K recorded accesses receive the farthest-distance priority, with oldest recorded access breaking ties.
+
+**Example.** With K equal to two, a one-hit entry is considered less established than an entry with two recent hits when the cache needs space.
+
+**Why here.** The service exposes LRU-K as an alternative admission policy for its memory, disk, and SQLite replacers.
+
+**Tradeoffs.** Each entry carries access history and the current implementation scans entries to choose a victim. Pinned entries are skipped, and admission can fail if no eligible victim frees enough space.
+
+**Code and ownership.** [`LruKReplacer::evict`](storage-node/src/cache/replacer/lru_k.rs#L52), [`record_access`](storage-node/src/cache/replacer/lru_k.rs#L85). Inherited.
+
+
+
+**Used in.** [Cache replacement policy](#subsystem-cache-replacement-policy). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-source-reads-and-complete-file-publication"></a>
+
+### 4. Source reads and complete-file publication
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`storage-node/src/disk/disk_manager.rs`](storage-node/src/disk/disk_manager.rs), [`storage-node/src/disk/stream.rs`](storage-node/src/disk/stream.rs), [`storage-node/src/storage_reader/s3.rs`](storage-node/src/storage_reader/s3.rs), [`storage-node/src/storage_reader/s3_diskmock.rs`](storage-node/src/storage_reader/s3_diskmock.rs), [`storage-node/src/cache/data_store_cache/memdisk/mod.rs`](storage-node/src/cache/data_store_cache/memdisk/mod.rs).
+
+**Techniques.** [Ordered multi-object source streaming](#technique-ordered-object-streaming), [Canonical fixture-root validation](#technique-fixture-root-validation), [Complete-file cache publication](#technique-atomic-complete-file-publication).
+
+**Related concepts.** [cache publication](#cache-publication).
+
+<a id="technique-ordered-object-streaming"></a>
+
+<details>
+<summary>Ordered multi-object source streaming</summary>
+
+**Mechanism.** The S3 reader starts a GET for the current key, yields its body chunks, then advances to the next key after that body ends. The fixture reader follows the same sequential order using disk read streams. Both stop on an error rather than skipping to later objects.
+
+**Example.** A request with keys `["part-a", "part-b"]` emits all chunks from `part-a` before any chunk from `part-b`.
+
+**Why here.** The lower-level source abstraction can represent ordered multi-object reads even though the HTTP endpoint accepts one object.
+
+**Tradeoffs.** Reads are sequential and the byte stream does not mark object boundaries. `read_all` collects each object fully and is documented as unsafe when sizes are unknown.
+
+**Code and ownership.** [`S3ReaderStream::poll_next`](storage-node/src/storage_reader/s3.rs#L101), [`MockS3ReaderStream::poll_next`](storage-node/src/storage_reader/s3_diskmock.rs#L113). Inherited.
+
+
+
+**Used in.** [Source reads and complete-file publication](#subsystem-source-reads-and-complete-file-publication). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-fixture-root-validation"></a>
+
+<details>
+<summary>Canonical fixture-root validation</summary>
+
+**Mechanism.** Before local reads, the mock reader canonicalizes the fixture root and every requested path. It accepts only paths under the Parquet or text fixture directories, then converts the resolved path to UTF-8. Canonicalization resolves traversal and symlink components before the containment check.
+
+**Example.** A key that resolves from `tests/parquet` into a project source directory fails with permission denied.
+
+**Why here.** The test-source adapter turns request names into local file paths, so it enforces a fixture boundary at that conversion point.
+
+**Tradeoffs.** Fixture layout is fixed to the repository's `tests/parquet` and `tests/text` directories. This validation applies to the mock reader, not the remote S3 path.
+
+**Code and ownership.** [`MockS3Reader::validated_paths`](storage-node/src/storage_reader/s3_diskmock.rs#L61). Extension.
+
+
+
+**Used in.** [Source reads and complete-file publication](#subsystem-source-reads-and-complete-file-publication). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-atomic-complete-file-publication"></a>
+
+<details>
+<summary>Complete-file cache publication</summary>
+
+**Mechanism.** The disk manager creates a named temporary file in the destination directory, writes carried memory chunks and remaining stream chunks, flushes and syncs the file, then publishes with `persist_noclobber`. Competing writers cannot replace the first final file. A stream error returns before publication, leaving no final partial entry.
+
+**Example.** Two fills for one key may both create temporary files, but only one can publish the absent destination; the loser receives the publish error.
+
+**Why here.** Readers look up the final cache path, so publishing only after a complete write avoids exposing an in-progress object as a cache hit.
+
+**Tradeoffs.** The write needs temporary disk space alongside the eventual file. `sync_all` asks the operating system to sync file data, but the code does not sync the parent directory.
+
+**Code and ownership.** [`DiskManager::write_bytes_and_stream_to_disk`](storage-node/src/disk/disk_manager.rs#L89). Extension.
+
+
+
+**Used in.** [Source reads and complete-file publication](#subsystem-source-reads-and-complete-file-publication). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-http-admission-and-response-stream"></a>
+
+### 5. HTTP admission and response stream
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`storage-node/src/server.rs`](storage-node/src/server.rs).
+
+**Techniques.** [HTTP query parsing and single-object admission](#technique-http-query-single-object-admission).
+
+<a id="technique-http-query-single-object-admission"></a>
+
+<details>
+<summary>HTTP query parsing and single-object admission</summary>
+
+**Mechanism.** Warp parses the `/file` query into `S3Request`. The route converts its bucket and one `keys` value into an `S3` or fixture `MockS3` request, asks the manager for a receiver, then wraps that receiver as the HTTP body. The route has no request semaphore or explicit resource admission limit.
+
+**Example.** `GET /file?bucket=tests-parquet&keys=userdata1.parquet&is_test=true` becomes one mock-source object request.
+
+**Why here.** The route exposes the manager's object byte stream over HTTP and reports manager errors as status 500.
+
+**Tradeoffs.** The endpoint cannot request multiple object keys, and concurrent requests have no application-level permit cap. Cache/source streams apply their own channel bounds after request acceptance.
+
+**Code and ownership.** [`route`](storage-node/src/server.rs#L28). Inherited.
+
+
+
+**Used in.** [HTTP admission and response stream](#subsystem-http-admission-and-response-stream). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-parquet-client-and-compatibility-adapter"></a>
+
+### 6. Parquet client and compatibility adapter
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`storage-client/src/client.rs`](storage-client/src/client.rs).
+
+**Techniques.** [Temporary-file Parquet decode with bounded backpressure](#technique-temp-file-parquet-decode-backpressure), [Legacy success-only stream adapter](#technique-legacy-error-compatible-adapter).
+
+<a id="technique-temp-file-parquet-decode-backpressure"></a>
+
+<details>
+<summary>Temporary-file Parquet decode with bounded backpressure</summary>
+
+**Mechanism.** The client checks HTTP status, downloads response chunks into a 256 KiB buffered temporary file, flushes it, then decodes Parquet on Tokio's blocking pool. A capacity-32 channel carries `Result<RecordBatch>` values. If the receiver closes, `blocking_send` stops decoding. A decode error is sent as the terminal error item, then the temporary directory is dropped.
+
+**Example.** The checked API returns `Receiver<Result<RecordBatch>>`; callers can observe a page decode failure after earlier batches.
+
+**Why here.** Parquet metadata is at the end of the file, and blocking decode should not occupy an async executor worker.
+
+**Tradeoffs.** The full compressed object occupies temporary disk before decode starts. The channel bounds queued batches, not object bytes or decoded batch size.
+
+**Code and ownership.** [`get_data_from_response_checked`](storage-client/src/client.rs#L104), [`request_object_checked`](storage-client/src/client.rs#L144). Extension.
+
+
+
+**Used in.** [Parquet client and compatibility adapter](#subsystem-parquet-client-and-compatibility-adapter). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-legacy-error-compatible-adapter"></a>
+
+<details>
+<summary>Legacy success-only stream adapter</summary>
+
+**Mechanism.** The external `StorageClient` trait returns batches without a per-batch error type. Its adapter first consumes the checked receiver into a `Vec`, propagating any decode error before it returns. Only after all batches validate does it spawn a task that streams successful batches through the legacy receiver. The sync method then collects that receiver into another vector.
+
+**Example.** If the third batch fails to decode, `request_data` returns an error and exposes none of the first two batches as a successful stream.
+
+**Why here.** The adapter preserves the inherited trait signature while the checked API can report errors during consumption.
+
+**Tradeoffs.** Validation consumes memory proportional to all decoded batches, then the receiver delivery can retain that vector until sent. The checked API avoids this all-batches staging.
+
+**Code and ownership.** [`get_data_from_response`](storage-client/src/client.rs#L86), [`StorageClientImpl::request_data_sync`](storage-client/src/client.rs#L256). Extension.
+
+
+
+**Used in.** [Parquet client and compatibility adapter](#subsystem-parquet-client-and-compatibility-adapter). [Back to the subsystem map](#architecture-and-execution-guide).
 
 </details>
 
@@ -204,254 +620,3 @@ The driver uses the actual AWS SDK against an owned loopback HTTP object origin 
 Projection and row-group selection occur in the benchmark consumer after a full HTTP download. The public checked client still decodes all columns. These runs therefore measure that limitation and cannot claim server pushdown or network-byte savings. Cache-empty means an empty application cache, not an evicted host page cache. Setup smoke timings are not benchmark results.
 
 The [matched buffering workflow](.github/workflows/compare.yml) gates on the offline public-client verifier, then independently builds the frozen baseline and candidate on one host. Run 39740738996 passed the original matrix with all fixture hashes, five reversed-order rounds and the original 60-second stability singles. Both builds used the same server binary, dependencies and compiler. The detailed results and limits are in the [matched comparison report](docs/benchmarks/2026-10-22-buffering.md).
-
-## Implementation techniques
-
-This section covers active storage-node cache, source-reader, HTTP, and client paths in this adaptation. The explanations describe current code; design rationale is inferred from its behavior.
-
-| Active subsystem | Technique cards | Source |
-| --- | --- | --- |
-| Request identity and cache selection | [Source-framed cache identity](#technique-source-framed-cache-key), [Hash-sharded cache selection](#technique-hash-sharded-cache-selection) | [cache key](storage-node/src/cache/data_store_cache/mod.rs#L26), [manager](storage-node/src/storage_manager.rs#L36) |
-| Cache fill and memory/disk tiers | [Per-key single-flight fill](#technique-singleflight-cache-fill), [Memory-to-disk admission](#technique-tiered-cache-admission), [Bounded cache streams and pins](#technique-bounded-cache-streams) | [mem-disk cache](storage-node/src/cache/data_store_cache/memdisk/mod.rs#L216), [memory store](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L30), [disk store](storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs#L58) |
-| Cache replacement and SQLite | [LRU pin-aware eviction](#technique-lru-pinned-eviction), [LRU-K history eviction](#technique-lru-k-history-eviction), [SQLite incremental BLOB reads](#technique-sqlite-blob-streaming) | [LRU](storage-node/src/cache/replacer/lru.rs#L28), [LRU-K](storage-node/src/cache/replacer/lru_k.rs#L52), [SQLite](storage-node/src/cache/data_store_cache/sqlite/mod.rs#L103), [blob reader](storage-node/src/cache/data_store_cache/sqlite/blob.rs#L38) |
-| Source reading and disk publication | [Ordered object streaming](#technique-ordered-object-streaming), [Fixture-root validation](#technique-fixture-root-validation), [Complete-file publication](#technique-atomic-complete-file-publication) | [S3 reader](storage-node/src/storage_reader/s3.rs#L101), [fixture reader](storage-node/src/storage_reader/s3_diskmock.rs#L61), [disk writer](storage-node/src/disk/disk_manager.rs#L89) |
-| HTTP request handling | [Single-object HTTP query admission](#technique-http-query-single-object-admission) | [route](storage-node/src/server.rs#L28) |
-| Client decode and compatibility | [Temporary-file decode and backpressure](#technique-temp-file-parquet-decode-backpressure), [Legacy success-only adapter](#technique-legacy-error-compatible-adapter) | [client](storage-client/src/client.rs#L86) |
-
-<a id="technique-source-framed-cache-key"></a>
-
-<details>
-<summary>Source-framed cache identity</summary>
-
-**Mechanism.** `cache_key_from_request` hashes a source-kind byte, the key count, then each bucket and key as a big-endian byte length followed by UTF-8 bytes. The SHA-256 digest is rendered as lowercase hex. For example, `MockS3("tests-parquet", ["a.parquet"])` receives a different identity from `S3` with the same names.
-
-**Example.** A bucket `ab` plus key `c` hashes as framed parts, so it cannot be confused with bucket `a` plus key `bc`.
-
-**Why here.** The manager uses the digest for cache lookup and filenames, so source and component boundaries must remain distinct.
-
-**Tradeoffs.** The digest hides readable request names and adds hashing work. It avoids delimiter ambiguity and request-derived path components.
-
-**Code and ownership.** [`cache_key_from_request`](storage-node/src/cache/data_store_cache/mod.rs#L26). Extension.
-
-</details>
-
-<a id="technique-hash-sharded-cache-selection"></a>
-
-<details>
-<summary>Hash-sharded cache selection</summary>
-
-**Mechanism.** `StorageManagerImpl::get_data` hashes the framed key with CRC32 and selects one cache from its vector using the remainder. It checks that shard, fills it on a miss, then opens the cached stream.
-
-**Example.** `index = crc32(cache_key) % caches.len()` chooses the cache handling a request.
-
-**Why here.** The manager shares work across multiple independently synchronized cache instances without a manager-wide lock.
-
-**Tradeoffs.** Every request for one key reaches the same shard, but a hot key remains concentrated there. The implementation assumes the cache vector is nonempty.
-
-**Code and ownership.** [`StorageManagerImpl::get_data`](storage-node/src/storage_manager.rs#L36). Inherited.
-
-</details>
-
-<a id="technique-singleflight-cache-fill"></a>
-
-<details>
-<summary>Per-key single-flight cache fill</summary>
-
-**Mechanism.** The mem-disk cache records an `Incompleted` state and a notifier by cache key before reading the source. A concurrent fill increments the waiter count and awaits notification. The completing task stores the size and completed tier before waking waiters. A source error removes the pending state and wakes waiters with a failed fill.
-
-**Example.** Two simultaneous misses for one object share the first source read; the second call waits for its result instead of starting another read.
-
-**Why here.** A slow object fetch can otherwise multiply source traffic for identical concurrent requests.
-
-**Tradeoffs.** Waiters depend on the fill path removing pending state on every error. This coordination is per cache instance and does not coordinate separate processes.
-
-**Code and ownership.** [`MemDiskStoreCache::put_data_to_cache`](storage-node/src/cache/data_store_cache/memdisk/mod.rs#L284). Inherited.
-
-</details>
-
-<a id="technique-tiered-cache-admission"></a>
-
-<details>
-<summary>Memory-to-disk cache admission</summary>
-
-**Mechanism.** The cache streams source chunks into memory while tracking total bytes. If the per-file memory threshold is crossed, it removes the partial memory entry, carries the accumulated chunks to disk, then appends the remaining source stream. If the memory replacer cannot admit the completed item, it also falls back to disk.
-
-**Example.** With a 10-byte threshold, chunks of 4, 4, and 4 bytes exceed the limit. The first 12 bytes move to the disk writer before later chunks.
-
-**Why here.** Small objects can be served from memory while larger ones avoid occupying the memory tier.
-
-**Tradeoffs.** A crossing object temporarily retains the accumulated chunks while disk publication proceeds. Disk-only and SQLite configurations use different paths.
-
-**Code and ownership.** [`MemDiskStoreCache::put_data_to_cache`](storage-node/src/cache/data_store_cache/memdisk/mod.rs#L284), [`MemStore::write_data`](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L59). Inherited.
-
-</details>
-
-<a id="technique-bounded-cache-streams"></a>
-
-<details>
-<summary>Bounded cache streams and pin lifetime</summary>
-
-**Mechanism.** Disk and memory readers send chunks through bounded Tokio channels. A disk reader caps its read buffer by the configured maximum. The replacer pins a cached entry while a stream consumes it; the disk task unpins after completion, receiver closure, or read failure. Memory delivery clones the stored chunk references and unpins after sending.
-
-**Example.** The disk reader uses at most `min(file_size, max_disk_reader_buffer_size)` as its read buffer and a 512-item channel.
-
-**Why here.** Bounded channels let downstream reads slow producers and pins prevent eviction during active access.
-
-**Tradeoffs.** The channel capacity is measured in chunks, not bytes. Memory delivery clones its `Vec<Bytes>` for the task, and SQLite uses a separate capacity of five.
-
-**Code and ownership.** [`DiskStore::read_data`](storage-node/src/cache/data_store_cache/memdisk/data_store/disk.rs#L58), [`MemStore::read_data`](storage-node/src/cache/data_store_cache/memdisk/data_store/memory.rs#L30). Mixed.
-
-</details>
-
-<a id="technique-sqlite-blob-streaming"></a>
-
-<details>
-<summary>SQLite incremental BLOB reads</summary>
-
-**Mechanism.** SQLite cache entries store bytes in a BLOB and the replacer maps the cache key to its row ID. A reader opens a read-only connection, reads the BLOB in configured chunks, and sends each chunk through a bounded channel.
-
-**Example.** With a 1,024-byte reader buffer, `SqliteBlobReader` advances through the BLOB without first materializing the full object as one byte vector.
-
-**Why here.** The SQLite backend can serve stored objects through the same receiver-based interface as the memory and disk stores.
-
-**Tradeoffs.** The in-memory replacer index is not reconstructed from the database after process restart. The store's drop handler removes its configured database file.
-
-**Code and ownership.** [`SqliteStoreCache::get_data_from_cache`](storage-node/src/cache/data_store_cache/sqlite/mod.rs#L103), [`SqliteBlobReader`](storage-node/src/cache/data_store_cache/sqlite/blob.rs#L38). Inherited.
-
-</details>
-
-<a id="technique-lru-pinned-eviction"></a>
-
-<details>
-<summary>LRU eviction with read pins</summary>
-
-**Mechanism.** The LRU replacer keeps entries in access order. A hit moves the entry to the newest end. Admission scans oldest to newest and removes unpinned entries until the new item's size fits. A pinned entry remains in the cache while a reader uses it.
-
-**Example.** If the oldest 9-byte entry is pinned and a new 2-byte item exceeds capacity, insertion can fail even when later entries are smaller.
-
-**Why here.** Capacity is tracked in bytes, and cache readers need a stable entry during streaming.
-
-**Tradeoffs.** Pinning can prevent admission while enough bytes appear occupied. The policy does not evict pinned data to satisfy capacity.
-
-**Code and ownership.** [`LruReplacer::get_value`](storage-node/src/cache/replacer/lru.rs#L28), [`LruReplacer::put_value`](storage-node/src/cache/replacer/lru.rs#L37), and pin methods at [`lru.rs`](storage-node/src/cache/replacer/lru.rs#L89). Inherited.
-
-</details>
-
-<a id="technique-lru-k-history-eviction"></a>
-
-<details>
-<summary>LRU-K history-based eviction</summary>
-
-**Mechanism.** The LRU-K replacer records up to K access timestamps per entry. It evicts the unpinned entry with the greatest backward K-distance. Entries with fewer than K recorded accesses receive the farthest-distance priority, with oldest recorded access breaking ties.
-
-**Example.** With K equal to two, a one-hit entry is considered less established than an entry with two recent hits when the cache needs space.
-
-**Why here.** The service exposes LRU-K as an alternative admission policy for its memory, disk, and SQLite replacers.
-
-**Tradeoffs.** Each entry carries access history and the current implementation scans entries to choose a victim. Pinned entries are skipped, and admission can fail if no eligible victim frees enough space.
-
-**Code and ownership.** [`LruKReplacer::evict`](storage-node/src/cache/replacer/lru_k.rs#L52), [`record_access`](storage-node/src/cache/replacer/lru_k.rs#L85). Inherited.
-
-</details>
-
-<a id="technique-ordered-object-streaming"></a>
-
-<details>
-<summary>Ordered multi-object source streaming</summary>
-
-**Mechanism.** The S3 reader starts a GET for the current key, yields its body chunks, then advances to the next key after that body ends. The fixture reader follows the same sequential order using disk read streams. Both stop on an error rather than skipping to later objects.
-
-**Example.** A request with keys `["part-a", "part-b"]` emits all chunks from `part-a` before any chunk from `part-b`.
-
-**Why here.** The lower-level source abstraction can represent ordered multi-object reads even though the HTTP endpoint accepts one object.
-
-**Tradeoffs.** Reads are sequential and the byte stream does not mark object boundaries. `read_all` collects each object fully and is documented as unsafe when sizes are unknown.
-
-**Code and ownership.** [`S3ReaderStream::poll_next`](storage-node/src/storage_reader/s3.rs#L101), [`MockS3ReaderStream::poll_next`](storage-node/src/storage_reader/s3_diskmock.rs#L113). Inherited.
-
-</details>
-
-<a id="technique-fixture-root-validation"></a>
-
-<details>
-<summary>Canonical fixture-root validation</summary>
-
-**Mechanism.** Before local reads, the mock reader canonicalizes the fixture root and every requested path. It accepts only paths under the Parquet or text fixture directories, then converts the resolved path to UTF-8. Canonicalization resolves traversal and symlink components before the containment check.
-
-**Example.** A key that resolves from `tests/parquet` into a project source directory fails with permission denied.
-
-**Why here.** The test-source adapter turns request names into local file paths, so it enforces a fixture boundary at that conversion point.
-
-**Tradeoffs.** Fixture layout is fixed to the repository's `tests/parquet` and `tests/text` directories. This validation applies to the mock reader, not the remote S3 path.
-
-**Code and ownership.** [`MockS3Reader::validated_paths`](storage-node/src/storage_reader/s3_diskmock.rs#L61). Extension.
-
-</details>
-
-<a id="technique-atomic-complete-file-publication"></a>
-
-<details>
-<summary>Complete-file cache publication</summary>
-
-**Mechanism.** The disk manager creates a named temporary file in the destination directory, writes carried memory chunks and remaining stream chunks, flushes and syncs the file, then publishes with `persist_noclobber`. Competing writers cannot replace the first final file. A stream error returns before publication, leaving no final partial entry.
-
-**Example.** Two fills for one key may both create temporary files, but only one can publish the absent destination; the loser receives the publish error.
-
-**Why here.** Readers look up the final cache path, so publishing only after a complete write avoids exposing an in-progress object as a cache hit.
-
-**Tradeoffs.** The write needs temporary disk space alongside the eventual file. `sync_all` asks the operating system to sync file data, but the code does not sync the parent directory.
-
-**Code and ownership.** [`DiskManager::write_bytes_and_stream_to_disk`](storage-node/src/disk/disk_manager.rs#L89). Extension.
-
-</details>
-
-<a id="technique-http-query-single-object-admission"></a>
-
-<details>
-<summary>HTTP query parsing and single-object admission</summary>
-
-**Mechanism.** Warp parses the `/file` query into `S3Request`. The route converts its bucket and one `keys` value into an `S3` or fixture `MockS3` request, asks the manager for a receiver, then wraps that receiver as the HTTP body. The route has no request semaphore or explicit resource admission limit.
-
-**Example.** `GET /file?bucket=tests-parquet&keys=userdata1.parquet&is_test=true` becomes one mock-source object request.
-
-**Why here.** The route exposes the manager's object byte stream over HTTP and reports manager errors as status 500.
-
-**Tradeoffs.** The endpoint cannot request multiple object keys, and concurrent requests have no application-level permit cap. Cache/source streams apply their own channel bounds after request acceptance.
-
-**Code and ownership.** [`route`](storage-node/src/server.rs#L28). Inherited.
-
-</details>
-
-<a id="technique-temp-file-parquet-decode-backpressure"></a>
-
-<details>
-<summary>Temporary-file Parquet decode with bounded backpressure</summary>
-
-**Mechanism.** The client checks HTTP status, downloads response chunks into a 256 KiB buffered temporary file, flushes it, then decodes Parquet on Tokio's blocking pool. A capacity-32 channel carries `Result<RecordBatch>` values. If the receiver closes, `blocking_send` stops decoding. A decode error is sent as the terminal error item, then the temporary directory is dropped.
-
-**Example.** The checked API returns `Receiver<Result<RecordBatch>>`; callers can observe a page decode failure after earlier batches.
-
-**Why here.** Parquet metadata is at the end of the file, and blocking decode should not occupy an async executor worker.
-
-**Tradeoffs.** The full compressed object occupies temporary disk before decode starts. The channel bounds queued batches, not object bytes or decoded batch size.
-
-**Code and ownership.** [`get_data_from_response_checked`](storage-client/src/client.rs#L104), [`request_object_checked`](storage-client/src/client.rs#L144). Extension.
-
-</details>
-
-<a id="technique-legacy-error-compatible-adapter"></a>
-
-<details>
-<summary>Legacy success-only stream adapter</summary>
-
-**Mechanism.** The external `StorageClient` trait returns batches without a per-batch error type. Its adapter first consumes the checked receiver into a `Vec`, propagating any decode error before it returns. Only after all batches validate does it spawn a task that streams successful batches through the legacy receiver. The sync method then collects that receiver into another vector.
-
-**Example.** If the third batch fails to decode, `request_data` returns an error and exposes none of the first two batches as a successful stream.
-
-**Why here.** The adapter preserves the inherited trait signature while the checked API can report errors during consumption.
-
-**Tradeoffs.** Validation consumes memory proportional to all decoded batches, then the receiver delivery can retain that vector until sent. The checked API avoids this all-batches staging.
-
-**Code and ownership.** [`get_data_from_response`](storage-client/src/client.rs#L86), [`StorageClientImpl::request_data_sync`](storage-client/src/client.rs#L256). Extension.
-
-</details>
